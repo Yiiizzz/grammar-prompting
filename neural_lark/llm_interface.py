@@ -4,15 +4,24 @@ import os
 import pickle
 from pathlib import Path
 from typing import Any, Dict, List
+import json
 
 import openai
 import google.generativeai as palm
 import google.api_core.exceptions as palm_exceptions
 
+from http import HTTPStatus
+import dashscope
+from dashscope import Generation
+from zhipuai import ZhipuAI
+
+
+
 import neural_lark.utils as utils
 from neural_lark.flags import FLAGS
 from neural_lark.train_utils import logger
 from neural_lark.structs import LLMResponse
+
 
 
 class LargeLanguageModel(abc.ABC):
@@ -70,7 +79,8 @@ class LargeLanguageModel(abc.ABC):
         cache_filepath = Path(FLAGS.llm_cache_dir) / cache_filename
         if not os.path.exists(cache_filepath):
             os.makedirs(os.path.dirname(cache_filepath), exist_ok=True)
-        if disable_cache or not os.path.exists(cache_filepath):
+        need_fresh = disable_cache or not os.path.exists(cache_filepath)
+        if need_fresh:
             logger.debug(f"Querying LLM {llm_id} with new prompt.")
             completions = self._sample_completions(prompt,
                                                    temperature,
@@ -79,12 +89,23 @@ class LargeLanguageModel(abc.ABC):
             with open(cache_filepath, 'wb') as f:
                 pickle.dump(completions, f)
             logger.debug(f"Saved LLM response to {cache_filepath}.")
-        
-        # Load the saved completion.
-        with open(cache_filepath, 'rb') as f:
-            completions = pickle.load(f)
-        logger.debug(f"Loaded LLM response from {cache_filepath}.")
-        return completions
+            return completions
+
+        # Load the saved completion. If cache is corrupted, re-query once.
+        try:
+            with open(cache_filepath, 'rb') as f:
+                completions = pickle.load(f)
+            logger.debug(f"Loaded LLM response from {cache_filepath}.")
+            return completions
+        except (EOFError, pickle.UnpicklingError):
+            logger.warning(f"Cache file {cache_filepath} corrupted, regenerating.")
+            completions = self._sample_completions(prompt,
+                                                   temperature,
+                                                   stop_token, num_completions)
+            with open(cache_filepath, 'wb') as f:
+                pickle.dump(completions, f)
+            logger.debug(f"Overwrote corrupted cache at {cache_filepath}.")
+            return completions
     
     def greedy_completion(self,
                           prompt: str,
@@ -375,6 +396,162 @@ class ChatGPT(LargeLanguageModel):
                            other_info=raw_response.copy())
 
 
+class Qwen(LargeLanguageModel):
+    DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
+
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+        dashscope.api_key = self.DASHSCOPE_API_KEY
+
+    def get_id(self) -> str:
+        return f"qwen_{self._model_name}"
+
+    def _sample_completions(
+            self,
+            prompt: str,
+            temperature: float,
+            stop_token: str,
+            num_completions: int = 1) -> List[LLMResponse]:
+
+        # 目前先只支持生成一个 completion
+        if num_completions != 1:
+            logger.warning("Qwen currently only supports num_completions=1; got "
+                           f"{num_completions}, will use 1 instead.")
+            num_completions = 1
+
+        response = None
+        for _ in range(6):
+            try:
+                rsp = Generation.call(
+                    model=self._model_name,
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=FLAGS.max_tokens,
+                    stop=stop_token if stop_token else None,
+                    result_format='text',  # 返回纯文本
+                )
+                if rsp.status_code != HTTPStatus.OK:
+                    raise RuntimeError(f"Qwen API error: {rsp.code}, {rsp.message}")
+                response = rsp
+                break
+            except Exception as e:
+                logger.warning(f"Qwen API error {e}, retrying...")
+                time.sleep(6)
+
+        if response is None:
+            raise RuntimeError("Failed to query Qwen API.")
+
+        # 按照 dashscope 文档，从 output 里取文本
+        # 如果你用的是别的 result_format，请对应调整这里的取值方式
+        try:
+            out = response["output_text"]
+        except Exception:
+            try:
+                out = response["output"]
+            except Exception:
+                out = ""
+        text = str(out).strip()
+
+        # 如果 dashscope 返回的是 JSON 字符串（包含 "text" 字段），取其中的 text 作为真正输出
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+                text = parsed["text"].strip()
+        except Exception:
+            pass
+
+        prompt_info = {
+            "temperature": temperature,
+            "num_completions": num_completions,
+            "stop_token": stop_token,
+        }
+        llm_resp = LLMResponse(
+            prompt,
+            text,
+            prompt_info=prompt_info,
+            other_info={"raw_output": text},
+        )
+        return [llm_resp]
+
+
+class ZhipuChat(LargeLanguageModel):
+    ZHIPU_API_KEY = os.environ.get("ZHIPUAI_API_KEY")
+
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+        self._client = ZhipuAI(api_key=self.ZHIPU_API_KEY)
+
+    def get_id(self) -> str:
+        # 用在缓存文件名前缀里
+        return f"zhipu_{self._model_name}"
+
+    def _sample_completions(
+            self,
+            prompt: str,
+            temperature: float,
+            stop_token: str,
+            num_completions: int = 1) -> List[LLMResponse]:
+
+        # 智谱的 chat 接口目前一次只返回 1 条，这里直接限制一下
+        if num_completions != 1:
+            logger.warning("ZhipuChat only supports num_completions=1 for now; "
+                           f"got {num_completions}, will use 1 instead.")
+            num_completions = 1
+
+        response = None
+        for _ in range(6):
+            try:
+                chunks = prompt.split("\n")
+                sys_prompt = chunks[0]
+                user_prompt = "\n".join(chunks[1:])
+
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+                response = self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=FLAGS.max_tokens,
+                )
+
+                break
+            except Exception as e:
+                logger.warning(f"Zhipu API error {e}, retrying...")
+                time.sleep(6)
+
+        if response is None:
+            raise RuntimeError("Failed to query Zhipu API.")
+
+        # 按官方 SDK 返回结构取文本，典型写法如下
+        choice = response.choices[0]
+        # 有的 SDK 是 choice.message.content，有的直接是 content，看你版本文档
+        text = getattr(choice.message, "content", None) or choice.message["content"]
+        text = text or ""
+        text = text.strip()
+
+        # 手动处理 stop_token（如果智谱接口本身不支持 stop 参数）
+        if stop_token:
+            idx = text.find(stop_token)
+            if idx != -1:
+                text = text[:idx]
+
+        prompt_info = {
+            "temperature": temperature,
+            "num_completions": num_completions,
+            "stop_token": stop_token,
+        }
+        llm_resp = LLMResponse(
+            prompt,
+            text,
+            prompt_info=prompt_info,
+            other_info=response.model_dump() if hasattr(response, "model_dump") else response.__dict__,
+        )
+        return [llm_resp]
+
+
+
 def setup_llm(engine):
     split_point = engine.index("/")
     platform, engine_short = engine[:split_point], engine[split_point+1:]
@@ -387,6 +564,10 @@ def setup_llm(engine):
             llm = GPT(engine_short, use_azure=False)
         else:
             llm = ChatGPT(engine_short)
+    elif platform == "qwen":
+        llm = Qwen(engine_short)
+    elif platform == "zhipu":
+        llm = ZhipuChat(engine_short)
     else:
         raise NotImplementedError(f"platform {platform} not supported")
     return llm
