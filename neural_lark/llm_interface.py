@@ -5,6 +5,7 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, List
 import json
+import hashlib
 
 import openai
 import google.generativeai as palm
@@ -21,6 +22,8 @@ import neural_lark.utils as utils
 from neural_lark.flags import FLAGS
 from neural_lark.train_utils import logger
 from neural_lark.structs import LLMResponse
+from neural_lark.exp_utils import build_cache_dir
+
 
 
 
@@ -65,20 +68,23 @@ class LargeLanguageModel(abc.ABC):
         are saved to disk.
         """
 
-        # Set up the cache file.
-        os.makedirs(FLAGS.llm_cache_dir, exist_ok=True)
+        # Set up the cache file (分层目录).
+        cfg = vars(FLAGS)
+        cache_dir = build_cache_dir(cfg, root=FLAGS.llm_cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+
         llm_id = self.get_id()
         prompt_id = utils.str_to_identifier(prompt)
         # If the temperature is 0, the seed does not matter.
-        escaped_stop_token = stop_token.replace("\n", "\\n")
+        stop_hash = hashlib.md5(stop_token.encode("utf-8")).hexdigest()
         if temperature == 0.0:
-            config_id = f"most_likely_{num_completions}_{escaped_stop_token}_{FLAGS.freq_penalty}"
+            config_id = f"most_likely_{num_completions}_{stop_hash}_{FLAGS.freq_penalty}"
         else:
-            config_id = f"{temperature}_{FLAGS.seed}_{num_completions}_{escaped_stop_token}_{FLAGS.freq_penalty}"
+            config_id = f"{temperature}_{FLAGS.seed}_{num_completions}_{stop_hash}_{FLAGS.freq_penalty}"
+
         cache_filename = f"{llm_id}_{config_id}_{prompt_id}.pkl"
-        cache_filepath = Path(FLAGS.llm_cache_dir) / cache_filename
-        if not os.path.exists(cache_filepath):
-            os.makedirs(os.path.dirname(cache_filepath), exist_ok=True)
+        cache_filepath = Path(cache_dir) / cache_filename
+
         need_fresh = disable_cache or not os.path.exists(cache_filepath)
         if need_fresh:
             logger.debug(f"Querying LLM {llm_id} with new prompt.")

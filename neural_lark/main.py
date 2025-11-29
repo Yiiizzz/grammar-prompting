@@ -19,6 +19,8 @@ from neural_lark.earley import predict_program_with_earley_correction, predict_r
 from neural_lark.train_utils import logger, setup_logger_file
 from neural_lark.lark_utils import * 
 from neural_lark.overnight_utils import remove_lf_space as remove_lf_space_overnight
+from neural_lark.code_retriever import CodeEmbedder, CodeIndex, build_code_index_on_targets,SymbolMapper,refine_symbols_with_mapper
+from neural_lark.exp_utils import build_log_dir
 
 
 def construct_rule_instruction(rules, dataset):
@@ -52,7 +54,9 @@ prompt_templates = {
     },
     "wrule": {
         "instruction": ("You are an expert programmer, and you need to write a program" 
-                        " for the given natural language query.\n"),
+                        " for the given natural language query.\n"
+                        "You must output ONLY the program in the target DSL, "
+                        "on a single line, with no explanation or natural language.\n"),
         "rule_instruction": "",
         "exemplar": lambda ex: f"query: {ex.source}\nBNF grammar rules:\n{ex.grammar}{DELIMITER}{ex.target}\n\n",
         "rule_exemplar": lambda ex: f"query: {ex.source}\nBNF grammar rules:\n{ex.grammar}\n\n",
@@ -77,6 +81,31 @@ prompt_templates = {
         "prediction_given_rule": lambda ex: f"sentences:\n{ex.source}\nBNF grammar rules:\n{ex.grammar}{DELIMITER}",
     }
 }
+
+def auto_select_big_nonterminals(global_rules, top_k=5, min_branches=3):
+    """
+    从全局 SimpleRule 列表里自动挑出“分支很多”的非终结符，作为需要专门化的候选。
+    - global_rules: List[SimpleRule]
+    - top_k: 最多选多少个非终结符
+    - min_branches: 至少要有多少条规则才算“大”
+    """
+    import collections
+
+    lhs_count = collections.Counter()
+    for rule in global_rules:
+        lhs = rule.origin
+        lhs_count[lhs] += 1
+
+    # 去掉明显的 start 或特别小的符号，比如 "query"
+    candidates = [
+        nt for nt, cnt in lhs_count.items()
+        if cnt >= min_branches and nt not in {"query"}
+    ]
+
+    # 按规则数从大到小排序，取前 top_k 个
+    candidates.sort(key=lambda nt: lhs_count[nt], reverse=True)
+    return set(candidates[:top_k])
+
 
 def batch_prompt_predict(
     llm, 
@@ -173,7 +202,13 @@ def batch_prompt_wrule_predict(
         constrain_rule_gen_flag, #控制规则生成阶段是否用 Earley/grammar 约束
         constrain_prog_gen_flag, #控制程序生成阶段是否用 Earley 约束
         separate_rule_gen_flag, #是否把“写规则”和“写程序”拆成两阶段
-        lazy_constrain_flag, 
+        lazy_constrain_flag,
+        use_retrieved_rule_flag=False, 
+        code_embedder=None,
+        code_index=None,
+        grammar_index=None,
+        symbol_mapper=None,
+        to_specialize_nts=None,
         predefined_fewshot_prompt=None,
     ):
     """
@@ -190,33 +225,170 @@ def batch_prompt_wrule_predict(
     template_starts_wrule_pred = prompt_template["prediction"] #当前样本的“开始写规则”那部分起始文本，一般是query: ...\nBNF grammar rules:\n
     template_prog_given_rule_pred = prompt_template["prediction_given_rule"] #当前样本在“规则已知的情况下，要生成程序”的起始文本
     
-    #遍历每个测试样本 input_example。
+    #遍历每个测试样本 input_example
     for input_example in tqdm.tqdm(input_examples, total=len(input_examples)):
-        #第一步：构造“规则+程序”的 few-shot （fewshot_rule_prog_prompt）
-        # 如果没有预定义的 prompt，就自己拼
+        # 先为静态语法归纳 / HyDE 准备草稿程序
+        draft_program = None
+        if getattr(FLAGS, "use_static_grammar_induction", False):
+            # 静态语法归纳：改成用 std few-shot 先写一个 draft_program
+            std_template = prompt_templates["std"]
+
+            # 1) 构造 std 的 few-shot 前缀
+            std_prompt = std_template["instruction"]
+            # 用和最终阶段一样的 retrieve_fn，在 train_examples 里选 few-shot
+            std_exemplars = retrieve_fn(input_example, train_examples)
+
+            # 你可以用和 std baseline 一样的 num_shot；也可以手动设小一点
+            draft_k = FLAGS.num_shot  # 或者写成 8、12 自己试
+            std_exemplars = std_exemplars[:draft_k]
+
+            for ex in std_exemplars:
+                std_prompt += std_template["exemplar"](ex)  # 这里会拼 "query + program" 的示例
+
+            # 2) 加上当前样本的 query，让模型补 program
+            std_prompt += std_template["prediction"](input_example)
+            # std_template["prediction"] 等价于 f"query: {input_example.source}\nprogram:\n"
+
+            # 3) 调一次 LLM 得到草稿程序
+            draft_resp = llm.sample_completions(std_prompt, 0.0, stop_token="\n\n")[0]
+            draft_program = draft_resp.response_text.strip()
+            
+        elif FLAGS.retrieve_fn == "hyde" and code_embedder is not None and code_index is not None:
+            # 仅 HyDE 检索时，也需要一个 draft_program
+            std_template = prompt_templates["std"]
+            std_prompt = (
+                std_template["instruction"]
+                + f"query: {input_example.source}\nprogram:\n"
+            )
+            draft_resp = llm.sample_completions(std_prompt, 0.0, stop_token="\n\n")[0]
+            draft_program = draft_resp.response_text.strip()
+
+
+        #第一步：构造“规则+程序”的 few-shot
+        exemplars_for_rules = None
         if predefined_fewshot_prompt is None:
-            #用 BM25 / rand / all 从训练集里选出若干条 few-shot 示例。
-            exemplars = retrieve_fn(input_example, train_examples)
-            #先放一段prompt_template["instruction"]
+            # few-shot 选择：如果是 hyde 且有 draft_program，就用向量检索；否则用原来的 retrieve_fn
+            if FLAGS.retrieve_fn == "hyde" and draft_program is not None and code_embedder is not None and code_index is not None:
+                # 用 draft_program 在 code_index 上检索 batch_size 个 few-shot 示例
+                fewshot_k = FLAGS.batch_size if FLAGS.batch_size is not None else len(train_examples)
+                q_emb = code_embedder.embed(draft_program)[0]
+                idx = code_index.search(q_emb, fewshot_k)
+                exemplars = [train_examples[i] for i in idx]
+            else:
+                exemplars = retrieve_fn(input_example, train_examples)
+
+            # 用前 k 个 few-shot 例子里的语法来做并集（如果开启 use_retrieved_rule_flag）
+            topk = getattr(FLAGS, "retrieved_rule_topk", 8)
+            exemplars_for_rules = exemplars[:topk]
+
             fewshot_rule_prog_prompt = prompt_template["instruction"]
-            #如果模板里有 rule_instruction，（可能包含那全局 BNF 规则表），就拼上去。
             if prompt_template["rule_instruction"]:
                 fewshot_rule_prog_prompt += prompt_template["rule_instruction"]
-            #对前面选出的 exemplars 中的每个 exemplar
+
             for exemplar in exemplars:
-                #gen_min_lark(exemplar.target, global_parser)：用全局语法解析这条示例程序，抽取“刚好需要的最小规则集合”（专用子语法）。
-                #lark2bnf(...)：把这个子语法从 Lark 形式转成 BNF 文本。
                 exemplar.grammar = lark2bnf(gen_min_lark(exemplar.target, global_parser))
-                #把 exemplar 拼成“query + BNF 规则 + program”的形式，接到 fewshot_rule_prog_prompt 后面。
                 fewshot_rule_prog_prompt += template_rule_prog_ex(exemplar)
         else:
             fewshot_rule_prog_prompt = predefined_fewshot_prompt
+
+
+
+
+
         
         #先设一个标志位，控制后面要不要走“Earley 两阶段生成”（先规则、再程序）。
         do_earley_two_stage_gen_flag = False
         
+        # 分支 0：用“推荐语法”作为约束（静态归纳优先，其次 exemplar 并集）
+        if getattr(FLAGS, "use_static_grammar_induction", False) or use_retrieved_rule_flag:
+            agg_lark_grammar = None
+            agg_bnf_grammar = None
+
+            # 1) 静态语法归纳：draft_program -> Minimal Intent 子语法
+            if getattr(FLAGS, "use_static_grammar_induction", False) and draft_program is not None:
+                specialized_rules, nt_rename = None, None
+
+                # 只有在开了专门化开关时才尝试 specialize
+                if getattr(FLAGS, "use_nt_specialization_for_induction", False):
+                    specialized_rules, nt_rename = specialize_nonterminals_for_draft(
+                        draft_program,
+                        global_parser,
+                        to_specialize_nts=to_specialize_nts,
+                    )
+
+                if specialized_rules is not None and len(specialized_rules) > 0:
+                    # 专门化 + Minimal Intent 的路径（你现在已有的逻辑）
+                    rules_for_induction = list(specialized_rules)
+                    rules_for_induction += [r for r in global_rules if r not in specialized_rules]
+                    grammar_index_prime = build_grammar_index(rules_for_induction)
+                    agg_lark_grammar = induce_minimal_intent_grammar_from_draft(
+                        draft_program,
+                        rules_for_induction,
+                        grammar_index_prime,
+                        parser=None,
+                        symbol_mapper=symbol_mapper,
+                        nt_rename=nt_rename,
+                        start_lhs=global_parser.option.start,
+                        use_closure=FLAGS.use_closure_for_induction
+                    )
+                    if agg_lark_grammar is not None:
+                        agg_bnf_grammar = lark2bnf(agg_lark_grammar)
+                else:
+                    # 不做专门化 / 专门化失败：统一走全局 Minimal Intent
+                    if grammar_index is not None:
+                        agg_lark_grammar = induce_minimal_intent_grammar_from_draft(
+                            draft_program,
+                            global_rules,
+                            grammar_index,
+                            parser=global_parser,
+                            symbol_mapper=symbol_mapper,
+                            nt_rename=None,
+                            start_lhs=global_parser.option.start,
+                            use_closure=FLAGS.use_closure_for_induction
+                        )
+                        if agg_lark_grammar is not None:
+                            agg_bnf_grammar = lark2bnf(agg_lark_grammar)
+    
+
+
+            # 2) 如果静态归纳失败，再用 exemplar 并集兜底（前提是 use_retrieved_rule_flag 打开）
+            if agg_lark_grammar is None and use_retrieved_rule_flag:
+                agg_lark_grammar, agg_bnf_grammar = aggregate_grammar_from_examples(
+                    exemplars_for_rules, global_parser
+                )
+
+            # 3) 如果两种方式都没得到语法，退回后面的 lazy / earley 分支
+            if agg_lark_grammar is None:
+                logger.warning("no rules extracted / induced, fallback to lazy/earley branch")
+                do_earley_two_stage_gen_flag = True
+            else:
+                # 可选：检查是否都是合法规则
+                if not check_grammar_validity(global_rules, agg_lark_grammar):
+                    logger.warning("aggregated/induced grammar has invalid rules, still using it but be careful")
+
+                input_example.grammar = agg_bnf_grammar
+                prompt_for_prog = fewshot_rule_prog_prompt + template_prog_given_rule_pred(input_example)
+
+                if constrain_prog_gen_flag:
+                    try:
+                        local_parser = EarleyParser(decorate_grammar(agg_lark_grammar), start=global_parser.option.start)
+                    except Exception as e:
+                        logger.warning(f"failed to create parser, fallback to global parser: {e}")
+                        local_parser = global_parser
+                    pred_program = predict_program_with_earley_correction(llm, prompt_for_prog, local_parser)
+                else:
+                    resp = llm.sample_completions(prompt_for_prog, FLAGS.temperature, stop_token="\n\n")[0]
+                    pred_program = resp.response_text
+
+                ret_grammars = [agg_lark_grammar]
+                ret_predictions = [pred_program]
+
+
+
+
+
         #分支一：use_oracle_rule_flag（用真规则，不让 LLM 发明）即从上帝视角直接用正确program反推最正确的规则集合
-        if use_oracle_rule_flag:
+        elif use_oracle_rule_flag:
             bnf_grammar = lark2bnf(gen_min_lark(input_example.target, global_parser))
             input_example.grammar = bnf_grammar
 
@@ -422,55 +594,40 @@ if __name__ == "__main__":
     parse_args()
     random.seed(FLAGS.seed)
     config = vars(FLAGS)
-        # ===== New: structured log dir =====
-    def _sanitize(name: str) -> str:
-        """Make a string safe for Windows paths."""
-        import re
-        name = re.sub(r'[<>:"/\\|?*]+', '-', str(name))
-        return name.replace(' ', '_').strip(' .')
 
-    cfg = config  # 原始参数字典
-
-    # 顶层文件夹按模型
-    engine_folder = _sanitize(cfg.get("engine", "unknown_engine"))
-    # 第二层按数据集
-    dataset_folder = _sanitize(cfg.get("dataset", "unknown_dataset"))
-
-    # 短标签：shots + 模式 + 模板 + 约束
-    parts = []
-    shots = cfg.get("num_shot", None)
-    if shots is not None:
-        parts.append(f"{shots}shot")
-    parts.append(_sanitize(cfg.get("prompt_mode", "std")))
-    parts.append(_sanitize(cfg.get("prompt_template", "std")))
-    if cfg.get("add_rule_instruction_flag", False):
-        parts.append("instru")
-    if cfg.get("constrain_rule_gen_flag", False):
-        parts.append("gcon")
-    if cfg.get("constrain_prog_gen_flag", False):
-        parts.append("pcon")
-    if cfg.get("lazy_constrain_flag", False):
-        parts.append("lazy")
-    if cfg.get("use_oracle_rule_flag", False):
-        parts.append("oracle")
-    parts.append(f"s{cfg.get('seed', 0)}")
-
-    short_tag = "-".join(parts)
-
-    # 最终日志目录
-    log_dir = os.path.join("log", engine_folder, dataset_folder, short_tag)
-
-    # 用短标签作为实验名
-    exp_name = short_tag
-    wandb.init(project=project_name, group=group_name, name=exp_name, config=config)
+    # 使用统一的分层命名规则构建日志目录和实验名
+    log_dir, exp_name = build_log_dir(config)
 
     os.makedirs(log_dir, exist_ok=True)
-    setup_logger_file(logger, log_dir)
+    setup_logger_file(logger, log_dir, run_name=exp_name)
+
+    wandb.init(project=project_name, group=group_name, name=exp_name, config=config)
     wandb.run.log_code("./neural_lark")
+
 
 
     ##1.2 setup grammar and parser
     global_parser, global_rules = load_sem_parser(config)
+
+    # 1.2.1 为静态语法归纳构建语法索引
+    grammar_index = build_grammar_index(global_rules)
+
+    # 如果需要做 symbol 级幻觉映射，构建 SymbolMapper（用同一个 CodeEmbedder）
+    symbol_mapper = None
+    if getattr(FLAGS, "use_static_grammar_induction", False):
+        # 这里可以重用你之前为 HyDE 建的 CodeEmbedder，或者新建一个小的 embedder
+        symbol_embedder = CodeEmbedder(model_name="all-MiniLM-L6-v2")
+        known_symbols = grammar_index["known_symbols"]
+        symbol_mapper = SymbolMapper(symbol_embedder, known_symbols)
+
+    # 1.2.2 为专门化准备非终结符集合：
+    # - geoquery: 用我们手工挑的集合
+    # - 其他数据集: 自动从 global_rules 中选“大非终结符”
+    to_specialize_nts = None
+    if FLAGS.dataset == "geoquery":
+        to_specialize_nts = {"state", "city", "river", "place", "num"}
+    else:
+        to_specialize_nts = auto_select_big_nonterminals(global_rules, top_k=5, min_branches=3)
 
     ## 1.3 初始化 llm
     llm = setup_llm(FLAGS.engine)
@@ -479,13 +636,27 @@ if __name__ == "__main__":
     train_examples, dev_examples, test_examples = load_sempar_data(config)
     logger.info(f"loaded {len(train_examples)} indist examples, {len(dev_examples)} dev examples, {len(test_examples)} test examples")
 
+    # 2.5 如果检索模式为 hyde，则构建基于 target 程序的向量索引
+    code_embedder = None
+    code_index = None
+    if FLAGS.retrieve_fn == "hyde":
+        code_embedder = CodeEmbedder(model_name="all-MiniLM-L6-v2")
+        code_index = build_code_index_on_targets(train_examples, code_embedder)
+
     #3. 构造 few‑shot 检索函数和 prompt 模板
-    retrieve_fn = retrieve_fn_dict[FLAGS.retrieve_fn]
-    if config["retrieve_fn"] == "bm25":
+    if FLAGS.retrieve_fn == "hyde":
+        # hyde 模式下：few-shot 仍然用 BM25（基于 NL），要先建 bm25 索引
         bm25 = setup_bm25(train_examples)
-        retrieve_fn = functools.partial(retrieve_fn, batch_size=FLAGS.batch_size, bm25=bm25)
+        retrieve_fn = functools.partial(retrieve_fn_dict["bm25"], batch_size=FLAGS.batch_size, bm25=bm25)
     else:
-        retrieve_fn = functools.partial(retrieve_fn, batch_size=FLAGS.batch_size)
+        retrieve_fn = retrieve_fn_dict[FLAGS.retrieve_fn]
+        if config["retrieve_fn"] == "bm25":
+            bm25 = setup_bm25(train_examples)
+            retrieve_fn = functools.partial(retrieve_fn, batch_size=FLAGS.batch_size, bm25=bm25)
+        else:
+            retrieve_fn = functools.partial(retrieve_fn, batch_size=FLAGS.batch_size)
+
+
 
     prompt_template = prompt_templates[FLAGS.prompt_template]
     if FLAGS.add_rule_instruction_flag:
@@ -506,7 +677,20 @@ if __name__ == "__main__":
             test_prompts, test_prediction_counters = batch_prompt_predict(llm, test_examples, train_examples, prompt_template, retrieve_fn, use_linearized_tree_flag=FLAGS.use_linearized_tree, constrain_prog_gen_flag=FLAGS.constrain_prog_gen_flag, overnight_flag=FLAGS.dataset=="overnight", predefined_fewshot_prompt=predefined_fewshot_prompt)
             test_grammar_counters = None
         else:
-            test_prompts, test_prediction_counters, test_grammar_counters = batch_prompt_wrule_predict(llm, test_examples, train_examples, prompt_template, retrieve_fn, use_oracle_rule_flag=FLAGS.use_oracle_rule_flag, separate_rule_gen_flag=FLAGS.separate_rule_gen_flag, constrain_rule_gen_flag=FLAGS.constrain_rule_gen_flag, constrain_prog_gen_flag=FLAGS.constrain_prog_gen_flag, lazy_constrain_flag=FLAGS.lazy_constrain_flag, predefined_fewshot_prompt=predefined_fewshot_prompt)
+            test_prompts, test_prediction_counters, test_grammar_counters = batch_prompt_wrule_predict(
+                llm, test_examples, train_examples, prompt_template, retrieve_fn,
+                use_oracle_rule_flag=FLAGS.use_oracle_rule_flag,
+                separate_rule_gen_flag=FLAGS.separate_rule_gen_flag,
+                constrain_rule_gen_flag=FLAGS.constrain_rule_gen_flag,
+                constrain_prog_gen_flag=FLAGS.constrain_prog_gen_flag,
+                lazy_constrain_flag=FLAGS.lazy_constrain_flag,
+                use_retrieved_rule_flag=FLAGS.use_retrieved_rule_flag,
+                code_embedder=code_embedder,
+                code_index=code_index,
+                grammar_index=grammar_index,
+                symbol_mapper=symbol_mapper,
+                to_specialize_nts=to_specialize_nts,
+                predefined_fewshot_prompt=predefined_fewshot_prompt)
 
         ##  dump to json and wandb
         json_results = {

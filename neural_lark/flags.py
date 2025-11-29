@@ -45,6 +45,17 @@ def parse_args():
     parser.add_argument("--constrain_prog_gen_flag", action="store_true")
     parser.add_argument("--lazy_constrain_flag", action="store_true")
 
+    # 静态语法归纳（从 draft 程序归纳语法）
+    parser.add_argument("--use_static_grammar_induction", action="store_true")
+    parser.add_argument("--use_nt_specialization_for_induction", action="store_true")
+    parser.add_argument("--use_closure_for_induction", action="store_true")
+
+
+    
+    parser.add_argument("--use_retrieved_rule_flag", action="store_true")
+    parser.add_argument("--retrieved_rule_topk", type=int, default=8)
+
+
     ## for iterative prompting
     parser.add_argument("--num_iterations", type=int, default=1)
     parser.add_argument("--iter_prompt_template", type=str, default="iter")

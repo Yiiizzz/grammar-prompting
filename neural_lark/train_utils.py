@@ -19,13 +19,14 @@ def setup_logger():
 logger = setup_logger()
 
 
-def setup_logger_file(logger, log_dir):
+def setup_logger_file(logger, log_dir, run_name=None):
     """
     Send info to console, and detailed debug information in logfile
     (Seems not working)
     """
     timestr = time.strftime("%Y%m%d-%H%M%S")
-    logfile_path = os.path.join(log_dir, f"log_{timestr}.txt")
+    base = run_name or "log"
+    logfile_path = os.path.join(log_dir, f"{base}_{timestr}.txt")
     os.makedirs(os.path.dirname(logfile_path), exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(module)s - %(message)s")
