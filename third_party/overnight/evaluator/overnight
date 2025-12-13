@@ -4,5 +4,13 @@ then
   echo "Usage: $0 [domain] [examples_file]" 1>&2
   exit 1
 fi
-ln -s evaluator/sempre/module-classes.txt
-java -ea -Dmodules=core,freebase,overnight -Xms8G -Xmx10G -cp evaluator/sempre/libsempre/*:evaluator/sempre/lib/* edu.stanford.nlp.sempre.overnight.ExecuteLogicalForms -JavaExecutor.convertNumberValues false -executor JavaExecutor -SimpleWorld.domain ${1} -Dataset.splitDevFromTrain 0 -Grammar.tags generate general -ExecuteLogicalForms.inPath ${2}
+ln -sf evaluator/sempre/module-classes.txt module-classes.txt 2>/dev/null
+java -ea -Dmodules=core,freebase,overnight -Xms2G -Xmx4G \
+  -cp "evaluator/sempre/libsempre/*;evaluator/sempre/lib/*" \
+  edu.stanford.nlp.sempre.overnight.ExecuteLogicalForms \
+  -JavaExecutor.convertNumberValues false \
+  -executor JavaExecutor \
+  -SimpleWorld.domain "${1}" \
+  -Dataset.splitDevFromTrain 0 \
+  -Grammar.tags generate general \
+  -ExecuteLogicalForms.inPath "${2}"

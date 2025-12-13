@@ -49,7 +49,8 @@ def parse_args():
     parser.add_argument("--use_static_grammar_induction", action="store_true")
     parser.add_argument("--use_nt_specialization_for_induction", action="store_true")
     parser.add_argument("--use_closure_for_induction", action="store_true")
-
+    parser.add_argument("--use_graph_spreading_induction", action="store_true") 
+    parser.add_argument("--use_std_fallback", action="store_true")
 
     
     parser.add_argument("--use_retrieved_rule_flag", action="store_true")

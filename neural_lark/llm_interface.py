@@ -445,7 +445,11 @@ class Qwen(LargeLanguageModel):
                 time.sleep(6)
 
         if response is None:
-            raise RuntimeError("Failed to query Qwen API.")
+            logger.warning("Failed to query Qwen API after retries, return empty response.")
+            empty = LLMResponse(prompt, "", prompt_info={}, other_info={})
+            return [empty]
+
+
 
         # 按照 dashscope 文档，从 output 里取文本
         # 如果你用的是别的 result_format，请对应调整这里的取值方式

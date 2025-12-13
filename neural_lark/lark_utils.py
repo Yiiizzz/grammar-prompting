@@ -314,33 +314,78 @@ def build_grammar_index(global_rules):
     从全局 SimpleRule 列表构建索引：
       - symbol_to_rules: 终结符 token -> 包含该 token 的规则集合
       - lhs_to_rules: 非终结符 -> 以该非终结符为左侧的规则集合
+      - child_to_parent_rules: 任意符号 -> 以该符号出现在 RHS 的父规则集合
+      - nt_forward: 非终结符 -> RHS 中出现过的子符号集合（图的正向边）
+      - nt_reverse: 符号 -> 所有以它为子符号的父非终结符集合（图的反向边）
+      - nt_components: 非终结符 -> 所在连通块 id（简单版社区/模块）
       - known_symbols: 所有出现过的终结符 token 列表
     """
     symbol_to_rules = collections.defaultdict(set)
     lhs_to_rules = collections.defaultdict(set)
     child_to_parent_rules = collections.defaultdict(set)
+    nt_forward = collections.defaultdict(set)
+    nt_reverse = collections.defaultdict(set)
     known_symbols = set()
 
     for rule in global_rules:
         lhs = rule.origin
         lhs_to_rules[lhs].add(rule)
         for sym in rule.expansion:
+            # 终结符（带引号）
             if isinstance(sym, str) and sym.startswith("\"") and sym.endswith("\""):
                 raw = sym.strip("\"")
-                # 简单版：直接对整个 raw 用 regex 抓 token，不区分括号前后
                 for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", raw):
                     symbol_to_rules[token].add(rule)
                     known_symbols.add(token)
-            else:
+                # 终结符也算一个“子符号”，方便向上扩散
                 child_to_parent_rules[sym].add(rule)
+                nt_forward[lhs].add(sym)
+                nt_reverse[sym].add(lhs)
+            else:
+                # 非终结符 / 其它符号
+                child_to_parent_rules[sym].add(rule)
+                nt_forward[lhs].add(sym)
+                nt_reverse[sym].add(lhs)
 
+    # 简单版“社区”：对 nt_forward / nt_reverse 建无向图，做连通分量
+    nt_graph = collections.defaultdict(set)
+    for a, children in nt_forward.items():
+        for b in children:
+            # 只在非终结符之间建连边（都不带引号的符号）
+            if isinstance(b, str) and (b not in symbol_to_rules):
+                nt_graph[a].add(b)
+                nt_graph[b].add(a)
+
+    nt_components = {}
+    comp_id = 0
+    visited = set()
+    for nt in nt_graph.keys():
+        if nt in visited:
+            continue
+        comp_nodes = []
+        stack = [nt]
+        visited.add(nt)
+        while stack:
+            u = stack.pop()
+            comp_nodes.append(u)
+            for v in nt_graph[u]:
+                if v not in visited:
+                    visited.add(v)
+                    stack.append(v)
+        for u in comp_nodes:
+            nt_components[u] = comp_id
+        comp_id += 1
 
     return {
         "symbol_to_rules": symbol_to_rules,
         "lhs_to_rules": lhs_to_rules,
         "child_to_parent_rules": child_to_parent_rules,
+        "nt_forward": nt_forward,
+        "nt_reverse": nt_reverse,
+        "nt_components": nt_components,
         "known_symbols": sorted(known_symbols),
     }
+
 
 def extract_symbols_from_program(program: str):
     """
@@ -394,6 +439,52 @@ def extract_symbols_from_parsed_program(program: str, parser, grammar_index=None
         candidates = candidates.intersection(known)
 
     return list(sorted(candidates))
+
+
+def collect_symbols_for_induction(
+    draft_program: str,
+    parser,
+    grammar_index=None,
+    symbol_mapper=None,
+):
+    """
+    从草稿程序中抽取 symbol 集合，并做一次“先分组再修复”的幻觉修复：
+      1) raw_tokens: 不做过滤，先尽量多抓 token
+      2) in_grammar: 已经在 DSL 里的 token（在 known_symbols 中）
+      3) out_of_grammar: 不在 DSL 里的 token，尝试用 SymbolMapper 映射到最近的 DSL 符号
+      4) 最终返回 in_grammar + repaired 的去重结果
+    """
+    # 1. 先尽量多拿 raw tokens，不在这里用 grammar_index 过滤
+    if parser is not None:
+        # 注意：这里不要传 grammar_index，避免在 extract 阶段就截断掉“非 DSL 的” token
+        raw_tokens = extract_symbols_from_parsed_program(
+            draft_program, parser, grammar_index=None
+        )
+    else:
+        raw_tokens = extract_symbols_from_program(draft_program)
+
+    # 如果没有 grammar_index，就没法知道哪些在 DSL 里，直接去重返回
+    if grammar_index is None:
+        return sorted(set(raw_tokens))
+
+    known = set(grammar_index.get("known_symbols", []))
+
+    # 2. 拆成“已在 DSL 里的”和“不在 DSL 里的”
+    in_grammar = [t for t in raw_tokens if t in known]
+    out_of_grammar = [t for t in raw_tokens if t not in known]
+
+    # 3. 对不在 DSL 里的 token 用 SymbolMapper 尝试修复
+    repaired = []
+    if symbol_mapper is not None:
+        for t in out_of_grammar:
+            mapped = symbol_mapper.map_symbol(t)
+            # 保险起见，再确认一下 mapped 也在 known 里
+            if mapped is not None and mapped in known:
+                repaired.append(mapped)
+
+    # 4. 最终 symbol 集合 = 已在 DSL 里的 + 修复成功的
+    symbols = sorted(set(in_grammar + repaired))
+    return symbols
 
 
 def induce_grammar_from_symbols(symbols, global_rules, grammar_index, start_lhs: str = None):
@@ -507,21 +598,17 @@ def induce_minimal_intent_grammar_from_draft(draft_program,
       - 按非终结符依赖向上回溯父规则，只保留能通向这些分支的路径
     返回：lark 子语法字符串；若完全匹配不上，则返回 None
     """
-    # 1. 从草稿中提取 symbol 集合
-    if parser is not None:
-        # 有 parser 时，用 parse tree 抽 symbol（更精确）
-        symbols = extract_symbols_from_parsed_program(
-            draft_program, parser, grammar_index=grammar_index
-        )
-    else:
-        # 没有 parser（比如在专门化世界），用正则简单抽取，再与 known_symbols 交集
-        symbols = extract_symbols_from_program(draft_program)
-        known = set(grammar_index.get("known_symbols", []))
-        symbols = [s for s in symbols if s in known]
-
+    # 1. 从草稿中抽取 symbol 集合，并做幻觉修复
+    symbols = collect_symbols_for_induction(
+        draft_program,
+        parser,
+        grammar_index=grammar_index,
+        symbol_mapper=symbol_mapper,
+    )
 
     symbol_to_rules = grammar_index["symbol_to_rules"]
     child_to_parent = grammar_index["child_to_parent_rules"]
+
 
     # 1.1 幻觉修正：把不在 DSL 里的 symbol 映射到最近合法 symbol
     if symbol_mapper is not None:
@@ -568,6 +655,134 @@ def induce_minimal_intent_grammar_from_draft(draft_program,
     # 这里先简单返回 rule_set 对应的 lark 语法
     lark_str = rulelist2larkstr(rule_set)
     return lark_str
+
+def induce_grammar_by_spreading_activation(
+    draft_program,
+    global_rules,
+    grammar_index,
+    parser=None,
+    symbol_mapper=None,
+    start_lhs: str = None,
+    k_hop_up: int = 2,
+    k_hop_down: int = 2,
+    large_nt_threshold: int = 20,
+):
+    """
+    图扩散版静态语法归纳（简化版）：
+      - 从 draft_program 提取 symbol
+      - 经 SymbolMapper 做幻觉修正
+      - 用 symbol_to_rules 找到含这些 symbol 的规则 -> 初始 rule_set（种子）
+      - 在非终结符图上做向上扩散（父节点、模块），再做受限向下扩散（避免大枚举 NT 全展开）
+      - 返回子语法的 lark 字符串；若匹配不上，返回 None
+    """
+    if grammar_index is None:
+        return None
+
+    # 1. 从草稿中抽取 symbol 集合，并做幻觉修复
+    symbols = collect_symbols_for_induction(
+        draft_program,
+        parser,
+        grammar_index=grammar_index,
+        symbol_mapper=symbol_mapper,
+    )
+
+
+    symbol_to_rules = grammar_index["symbol_to_rules"]
+    lhs_to_rules = grammar_index["lhs_to_rules"]
+    child_to_parent = grammar_index["child_to_parent_rules"]
+    nt_forward = grammar_index.get("nt_forward", {})
+    nt_reverse = grammar_index.get("nt_reverse", {})
+    nt_components = grammar_index.get("nt_components", {})
+
+    # 2. 初始 rule_set：所有包含这些 symbol 的规则
+    rule_set = set()
+    seed_nts = set()
+    for s in symbols:
+        for r in symbol_to_rules.get(s, []):
+            rule_set.add(r)
+            seed_nts.add(r.origin)
+
+    if not rule_set:
+        return None
+
+    activated_nts = set(seed_nts)
+
+    # 2.1 模块激活：把和 seed_nts 在同一个连通块里的 NT 一起激活
+    comp_to_nts = collections.defaultdict(set)
+    for nt, cid in nt_components.items():
+        comp_to_nts[cid].add(nt)
+    for nt in list(seed_nts):
+        cid = nt_components.get(nt, None)
+        if cid is None:
+            continue
+        for other in comp_to_nts[cid]:
+            if other not in activated_nts:
+                activated_nts.add(other)
+                for r in lhs_to_rules.get(other, []):
+                    rule_set.add(r)
+
+    # 3. 向上扩散（沿 child_to_parent / nt_reverse）
+    frontier = set(activated_nts)
+    for _ in range(k_hop_up):
+        new_frontier = set()
+        for nt in frontier:
+            # 从 NT 往父 NT
+            for parent_nt in nt_reverse.get(nt, []):
+                if parent_nt not in activated_nts:
+                    activated_nts.add(parent_nt)
+                    new_frontier.add(parent_nt)
+                    for r in lhs_to_rules.get(parent_nt, []):
+                        rule_set.add(r)
+        frontier = new_frontier
+        if not frontier:
+            break
+
+    # 如果指定了 start_lhs，可以保证它/它们在激活集合里
+    if start_lhs is not None:
+        # 有的语法 start_lhs 是字符串，有的是列表，这里统一成列表来处理
+        if isinstance(start_lhs, (list, tuple, set)):
+            start_symbols = list(start_lhs)
+        else:
+            start_symbols = [start_lhs]
+
+        for s in start_symbols:
+            if s not in activated_nts:
+                activated_nts.add(s)
+                for r in lhs_to_rules.get(s, []):
+                    rule_set.add(r)
+
+
+    # 4. 受限向下扩散（避免大枚举 NT 全展开）
+    frontier = set(activated_nts)
+    for _ in range(k_hop_down):
+        new_frontier = set()
+        for nt in frontier:
+            all_rules_for_lhs = list(lhs_to_rules.get(nt, []))
+            if not all_rules_for_lhs:
+                continue
+            # 大枚举节点：分支太多，避免一次性拉进来
+            if len(all_rules_for_lhs) > large_nt_threshold:
+                continue
+            # 小枚举节点：拉进来所有规则，并向下扩散
+            for r in all_rules_for_lhs:
+                if r not in rule_set:
+                    rule_set.add(r)
+            for r in all_rules_for_lhs:
+                for sym in r.expansion:
+                    # 向下只对非终结符扩散（不带引号、且不是纯终结符 token）
+                    if isinstance(sym, str) and not sym.startswith("\""):
+                        if sym not in activated_nts:
+                            activated_nts.add(sym)
+                            new_frontier.add(sym)
+        frontier = new_frontier
+        if not frontier:
+            break
+
+    # 5. 打包成 lark 语法
+    lark_str = rulelist2larkstr(rule_set)
+    return lark_str
+
+
 
 def collect_rules_from_parser(parser, debug_rules=None):
     """

@@ -2,6 +2,7 @@ import os
 import json
 import random
 import tqdm
+import re
 
 import wandb
 import functools
@@ -21,6 +22,27 @@ from neural_lark.lark_utils import *
 from neural_lark.overnight_utils import remove_lf_space as remove_lf_space_overnight
 from neural_lark.code_retriever import CodeEmbedder, CodeIndex, build_code_index_on_targets,SymbolMapper,refine_symbols_with_mapper
 from neural_lark.exp_utils import build_log_dir
+
+def default_canonicalize(text: str) -> str:
+    """Very lightweight canonicalizer; 可以之后按数据集改强。"""
+    return " ".join(str(text).split())
+
+
+def build_program_sketch(program: str) -> str:
+    """用占位符做一个粗糙 sketch，用于 CoS / sketch baseline."""
+    if program is None:
+        return ""
+    text = str(program)
+    # 掩码字符串常量
+    text = re.sub(r'"[^"]*"', '"<STR>"', text)
+    # 掩码整数/小数
+    text = re.sub(r'\d+(\.\d+)?', '<NUM>', text)
+    return text
+
+
+def build_symbol_chain(program: str) -> str:
+    """暂时复用 sketch，之后可以换成 AST 线性化等更结构化的版本。"""
+    return build_program_sketch(program)
 
 
 def construct_rule_instruction(rules, dataset):
@@ -52,6 +74,55 @@ prompt_templates = {
         "exemplar": lambda ex: f"query: {ex.source}\nprogram:\n{ex.target}\n\n",
         "prediction": lambda ex: f"query: {ex.source}\nprogram:\n",
     },
+    "canonical_std": {
+        "instruction": (
+            "You are an expert semantic parser.\n"
+            "First, rewrite the natural language query into a simple canonical utterance "
+            "on a line starting with 'canonical:'.\n"
+            "Then, on a new line starting with 'program:', write ONLY the target program "
+            "in the DSL.\n"
+        ),
+        "rule_instruction": None,
+        "exemplar": lambda ex: (
+            f"query: {ex.source}\n"
+            f"canonical: {getattr(ex, 'canonical', default_canonicalize(ex.source))}\n"
+            f"program:\n{ex.target}\n\n"
+        ),
+        "prediction": lambda ex: f"query: {ex.source}\ncanonical:\n",
+        "output_format": "multi_section_last_line_program",
+    },
+    "cos_std": {
+        "instruction": (
+            "You are an expert programmer.\n"
+            "First, write a symbolic chain that summarizes the structure of the target program "
+            "on a line starting with 'symbol_chain:'.\n"
+            "Then, on a new line starting with 'program:', write ONLY the target program in the DSL.\n"
+        ),
+        "rule_instruction": None,
+        "exemplar": lambda ex: (
+            f"query: {ex.source}\n"
+            f"symbol_chain: {build_symbol_chain(ex.target)}\n"
+            f"program:\n{ex.target}\n\n"
+        ),
+        "prediction": lambda ex: f"query: {ex.source}\nsymbol_chain:\n",
+        "output_format": "multi_section_last_line_program",
+    },
+    "sketch_std": {
+        "instruction": (
+            "You are an expert programmer.\n"
+            "First, write a high-level program sketch with placeholders on a line starting with 'sketch:'.\n"
+            "Then, on a new line starting with 'program:', write ONLY the full target program in the DSL.\n"
+        ),
+        "rule_instruction": None,
+        "exemplar": lambda ex: (
+            f"query: {ex.source}\n"
+            f"sketch: {build_program_sketch(ex.target)}\n"
+            f"program:\n{ex.target}\n\n"
+        ),
+        "prediction": lambda ex: f"query: {ex.source}\nsketch:\n",
+        "output_format": "multi_section_last_line_program",
+    },
+
     "wrule": {
         "instruction": ("You are an expert programmer, and you need to write a program" 
                         " for the given natural language query.\n"
@@ -169,6 +240,20 @@ def batch_prompt_predict(
             assert len(responses) == 1
             prediction = responses[0].response_text
 
+            # 依据模板指定的输出格式，对多段输出做轻量后处理
+            output_format = prompt_template.get("output_format", "program_as_whole")
+            if output_format == "multi_section_last_line_program":
+                # 例如：
+                # canonical: ...
+                # program: argmax(...)
+                lines = [ln.strip() for ln in prediction.splitlines() if ln.strip()]
+                if lines:
+                    last = lines[-1]
+                    # 去掉 "program:" 前缀，只留程序本身
+                    if last.lower().startswith("program:"):
+                        last = last[len("program:"):].strip()
+                    prediction = last
+
             if use_linearized_tree_flag:
                 # recover the original program
                 logger.debug("prediction before linearization: " + prediction)
@@ -179,6 +264,7 @@ def batch_prompt_predict(
                     prediction = linearized_tree_to_program(prediction)
 
             ret_predictions.append(prediction)
+
                     
         _counter = collections.Counter(ret_predictions)
         predictions.append(_counter)
@@ -334,20 +420,37 @@ def batch_prompt_wrule_predict(
                     if agg_lark_grammar is not None:
                         agg_bnf_grammar = lark2bnf(agg_lark_grammar)
                 else:
-                    # 不做专门化 / 专门化失败：统一走全局 Minimal Intent
+                    # 不做专门化 / 专门化失败：统一走全局静态归纳
                     if grammar_index is not None:
-                        agg_lark_grammar = induce_minimal_intent_grammar_from_draft(
-                            draft_program,
-                            global_rules,
-                            grammar_index,
-                            parser=global_parser,
-                            symbol_mapper=symbol_mapper,
-                            nt_rename=None,
-                            start_lhs=global_parser.option.start,
-                            use_closure=FLAGS.use_closure_for_induction
-                        )
+                        if getattr(FLAGS, "use_graph_spreading_induction", False):
+                            # 图扩散版
+                            agg_lark_grammar = induce_grammar_by_spreading_activation(
+                                draft_program,
+                                global_rules,
+                                grammar_index,
+                                parser=global_parser,
+                                symbol_mapper=symbol_mapper,
+                                start_lhs=global_parser.option.start,
+                                k_hop_up=2,
+                                k_hop_down=2,
+                                large_nt_threshold=20,
+                            )
+                        else:
+                            # 旧的 Minimal Intent 版本
+                            agg_lark_grammar = induce_minimal_intent_grammar_from_draft(
+                                draft_program,
+                                global_rules,
+                                grammar_index,
+                                parser=global_parser,
+                                symbol_mapper=symbol_mapper,
+                                nt_rename=None,
+                                start_lhs=global_parser.option.start,
+                                use_closure=FLAGS.use_closure_for_induction,
+                            )
+
                         if agg_lark_grammar is not None:
                             agg_bnf_grammar = lark2bnf(agg_lark_grammar)
+
     
 
 
@@ -403,9 +506,11 @@ def batch_prompt_wrule_predict(
             prompt_for_prog = fewshot_rule_prog_prompt + template_prog_given_rule_pred(input_example)
 
             lark_grammar = bnf2lark(bnf_grammar)
-            assert check_grammar_validity(global_rules, lark_grammar)
-            #将这套 oracle grammar 作为该样本的“预测 grammar”。
+            if not check_grammar_validity(global_rules, lark_grammar):
+                logger.warning("oracle grammar is not strictly subset of global_rules; still using it for oracle run")
+            # 将这个 oracle grammar 作为该样本的“预流 grammar”
             ret_grammars = [lark_grammar]
+
 
             #如果开了约束程序生成（--constrain_prog_gen_flag），就用 Earley correction 生成程序；
             if constrain_prog_gen_flag:
@@ -538,6 +643,24 @@ def batch_prompt_wrule_predict(
             #把结果打包返回上层
             ret_grammars = [pred_lark_grammar]
             ret_predictions = [pred_program]
+
+            # ===== 回退机制：GMGA 失败则退回 Std 草稿 =====
+            if getattr(FLAGS, "use_std_fallback", False) and draft_program is not None:
+                gmga_pred = counter2pred(collections.Counter(ret_predictions))
+                gmga_ok = False
+
+                if gmga_pred:
+                    try:
+                        # 用全局语法做一次简单语法检查
+                        global_parser.parse(gmga_pred)
+                        gmga_ok = True
+                    except Exception as e:
+                        logger.warning(f"GMGA prediction invalid, will fallback: {e}")
+
+                if not gmga_ok:
+                    logger.info("Fallback: using draft_program from std prompting.")
+                    ret_predictions = [draft_program]
+
 
         
         

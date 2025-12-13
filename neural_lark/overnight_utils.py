@@ -149,17 +149,31 @@ def execute(lfs, domain, eval_path="third_party/overnight"):
 
     cur_dir = os.getcwd()
     os.chdir(eval_path)
-    eval_script = "./evaluator/overnight"
+    eval_script = os.path.join("evaluator", "overnight")
 
-    tf = tempfile.NamedTemporaryFile(suffix=".examples")
+    # 把逻辑形式写到临时文件
+    tf = tempfile.NamedTemporaryFile(suffix=".examples", delete=False)
     for lf in lfs:
         p_lf = post_process(lf)
-        tf.write(str.encode(p_lf + "\n"))
-        tf.flush()
-    FNULL = open(os.devnull, "w")
-    msg = subprocess.check_output([eval_script, domain, tf.name], stderr=FNULL)
+        tf.write((p_lf + "\n").encode("utf-8"))
+    tf_name = tf.name
     tf.close()
+
+    # 用 bash 调用 overnight 脚本，并把错误输出也打出来
+    try:
+        msg = subprocess.check_output(
+            ["bash", eval_script, domain, tf_name],
+            stderr=subprocess.STDOUT,  # 把 stderr 合并到 stdout
+        )
+    except subprocess.CalledProcessError as e:
+        print("Overnight evaluator failed with output:")
+        print(e.output.decode("utf-8", errors="ignore"))
+        os.chdir(cur_dir)
+        raise
+
     msg = msg.decode("utf-8")
+
+
 
     denotations = [
         line.split("\t")[1]

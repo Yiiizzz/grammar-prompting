@@ -10,10 +10,16 @@ def sanitize(name: str) -> str:
     return name or "unknown"
 
 def build_induction_cfg_folder(cfg: Dict) -> str:
-    static = "static-on" if cfg.get("use_static_grammar_induction", False) else "static-off"
-    closure = "closure-on" if cfg.get("use_closure_for_induction", False) else "closure-off"
-    spec = "spec-on" if cfg.get("use_nt_specialization_for_induction", False) else "spec-off"
-    return f"indcfg_{static}_{closure}_{spec}"
+    """根据是否开静态归纳、图扩散、std 回退来命名目录。"""
+    static_flag = cfg.get("use_static_grammar_induction", False)
+    graph_flag = cfg.get("use_graph_spreading_induction", False)
+    fallback_flag = cfg.get("use_std_fallback", False)
+
+    static = "static-on" if static_flag else "static-off"
+    graph = "graph-on" if graph_flag else "graph-off"
+    fallback = "fallback-on" if fallback_flag else "fallback-off"
+
+    return f"indcfg_{static}_{graph}_{fallback}"
 
 def build_common_folders(cfg: Dict):
     """Return the list of path components from engine to seed."""
