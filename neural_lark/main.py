@@ -306,6 +306,19 @@ def batch_prompt_wrule_predict(
         lazy_constrain_flag: sample k candidates first; if no candidate is valid, then use early two-stage generation
     """
     prompts, predictions, grammars = [], [], []
+    induce_fail = 0
+    induce_total = 0
+
+    track_legality = (
+        getattr(FLAGS, "use_static_grammar_induction", False)
+        and getattr(FLAGS, "use_graph_spreading_induction", False)
+        and getattr(FLAGS, "use_std_fallback", False)
+    )
+
+    draft_total = draft_legal = 0
+    rewrite_total = rewrite_legal = 0
+    final_total = final_legal = 0
+
     template_rule_prog_ex = prompt_template["exemplar"] #把一个训练示例转成“query + BNF 规则 + program”的文本，用在 few-shot 里。
     template_rule_ex = prompt_template["rule_exemplar"] #把一个训练示例转成“query + BNF 规则（不带 program）”的文本，用在“只学写规则”的 few-shot。
     template_starts_wrule_pred = prompt_template["prediction"] #当前样本的“开始写规则”那部分起始文本，一般是query: ...\nBNF grammar rules:\n
@@ -338,6 +351,7 @@ def batch_prompt_wrule_predict(
             # 3) 调一次 LLM 得到草稿程序
             draft_resp = llm.sample_completions(std_prompt, 0.0, stop_token="\n\n")[0]
             draft_program = draft_resp.response_text.strip()
+
             
         elif FLAGS.retrieve_fn == "hyde" and code_embedder is not None and code_index is not None:
             # 仅 HyDE 检索时，也需要一个 draft_program
@@ -390,6 +404,10 @@ def batch_prompt_wrule_predict(
             agg_lark_grammar = None
             agg_bnf_grammar = None
 
+            if getattr(FLAGS, "use_static_grammar_induction", False):
+                induce_total += 1
+
+
             # 1) 静态语法归纳：draft_program -> Minimal Intent 子语法
             if getattr(FLAGS, "use_static_grammar_induction", False) and draft_program is not None:
                 specialized_rules, nt_rename = None, None
@@ -431,10 +449,16 @@ def batch_prompt_wrule_predict(
                                 parser=global_parser,
                                 symbol_mapper=symbol_mapper,
                                 start_lhs=global_parser.option.start,
-                                k_hop_up=2,
-                                k_hop_down=2,
-                                large_nt_threshold=20,
+                                k_hop_up=FLAGS.graph_k_up,
+                                k_hop_down=FLAGS.graph_k_down,
+                                large_nt_threshold=FLAGS.graph_large_nt_threshold,
+                                large_nt_percentile=FLAGS.graph_large_nt_percentile,
+                                max_rules=(FLAGS.graph_max_rules if FLAGS.graph_max_rules > 0 else auto_max_rules),
+                                min_rules=(FLAGS.graph_min_rules if FLAGS.graph_min_rules > 0 else auto_min_rules),
+                                max_k_up=FLAGS.graph_max_k_up,
+                                max_k_down=FLAGS.graph_max_k_down,
                             )
+
                         else:
                             # 旧的 Minimal Intent 版本
                             agg_lark_grammar = induce_minimal_intent_grammar_from_draft(
@@ -462,6 +486,8 @@ def batch_prompt_wrule_predict(
 
             # 3) 如果两种方式都没得到语法，退回后面的 lazy / earley 分支
             if agg_lark_grammar is None:
+                if getattr(FLAGS, "use_static_grammar_induction", False):
+                    induce_fail += 1
                 logger.warning("no rules extracted / induced, fallback to lazy/earley branch")
                 do_earley_two_stage_gen_flag = True
             else:
@@ -644,25 +670,56 @@ def batch_prompt_wrule_predict(
             ret_grammars = [pred_lark_grammar]
             ret_predictions = [pred_program]
 
-            # ===== 回退机制：GMGA 失败则退回 Std 草稿 =====
-            if getattr(FLAGS, "use_std_fallback", False) and draft_program is not None:
-                gmga_pred = counter2pred(collections.Counter(ret_predictions))
-                gmga_ok = False
 
-                if gmga_pred:
-                    try:
-                        # 用全局语法做一次简单语法检查
-                        global_parser.parse(gmga_pred)
-                        gmga_ok = True
-                    except Exception as e:
-                        logger.warning(f"GMGA prediction invalid, will fallback: {e}")
+        # ===== Unified fallback + legality tracking (applies to all branches) =====
+        rewrite_pred = counter2pred(collections.Counter(ret_predictions))  # pre-fallback second-stage program
 
-                if not gmga_ok:
-                    logger.info("Fallback: using draft_program from std prompting.")
-                    ret_predictions = [draft_program]
+        # Apply std fallback uniformly (graph-spreading path also needs this)
+        if getattr(FLAGS, "use_std_fallback", False) and draft_program is not None:
+            rewrite_ok = False
+            if rewrite_pred:
+                try:
+                    global_parser.parse(rewrite_pred)
+                    rewrite_ok = True
+                except Exception as e:
+                    logger.warning(f"rewrite prediction invalid, will fallback: {e}")
 
+            if not rewrite_ok:
+                logger.info("Fallback: using draft_program from std prompting.")
+                ret_predictions = [draft_program]
 
-        
+        final_pred = counter2pred(collections.Counter(ret_predictions))  # post-fallback final program
+
+        # Update legality counters (only in full pipeline)
+        if track_legality:
+            # draft legality
+            if getattr(FLAGS, "use_static_grammar_induction", False) and draft_program is not None:
+                draft_total += 1
+                try:
+                    global_parser.parse(draft_program)
+                    draft_legal += 1
+                except Exception:
+                    pass
+
+            # rewrite legality (pre-fallback)
+            if rewrite_pred is not None:
+                rewrite_total += 1
+                try:
+                    global_parser.parse(rewrite_pred)
+                    rewrite_legal += 1
+                except Exception:
+                    pass
+
+            # final legality (post-fallback)
+            if final_pred is not None:
+                final_total += 1
+                try:
+                    global_parser.parse(final_pred)
+                    final_legal += 1
+                except Exception:
+                    pass
+        # ===== End unified block =====
+
         
         #**“对当前这个样本收尾：记录用过的 prompt、整理预测结果、打日志，然后循环下一个样本”**
 
@@ -685,11 +742,34 @@ def batch_prompt_wrule_predict(
         logger.info(f"number of unique predictions: {len(_pred_counter)}")#这条样本有多少种不同的程序预测（一般情况下 1 种）。
         logger.info(f"frequency distribution of predictions: {list(_pred_counter.values())}")#每种预测出现了多少次（如果做多采样就有意义）。
 
-        logger.info(f"    source:\n{input_example.source}")#这条样本的自然语言输入。
-        logger.info(f"prediction:\n{counter2pred(_pred_counter)}")#这条样本的最终预测程序。
+        logger.info(f"    source:\n{input_example.source}")
+
+        show_rewrite_log = getattr(FLAGS, "use_static_grammar_induction", False)
+
+        if show_rewrite_log and draft_program is not None:
+            logger.info(f"draft_program:\n{draft_program}")
+            logger.info(f"rewrite_program:\n{rewrite_pred}")
+
+        logger.info(f"prediction:\n{counter2pred(_pred_counter)}")
+
         logger.info(f"    target:\n{input_example.target}")#gold program（真实标注程序）。
         logger.info(f"   grammar:\n{counter2pred(_grammar_counter)}")#取“出现次数最多的 grammar”作为这条样本的最终 grammar 预测。
         logger.info("-" * 80)#分界线
+
+    if track_legality:
+        def _rate(num, den):
+            return (num / den) if den else 0.0
+        logger.info(
+            "Legality rates (global_parser.parse): "
+            f"draft={draft_legal}/{draft_total}={_rate(draft_legal, draft_total):.3f}, "
+            f"rewrite={rewrite_legal}/{rewrite_total}={_rate(rewrite_legal, rewrite_total):.3f}, "
+            f"final={final_legal}/{final_total}={_rate(final_legal, final_total):.3f}"
+        )
+
+    if getattr(FLAGS, "use_static_grammar_induction", False):
+        rate = (induce_fail / induce_total) if induce_total > 0 else 0.0
+        logger.info(f"Induction failures: {induce_fail}/{induce_total}={rate:.3f} (triggered wrule fallback)")
+
     return prompts, predictions, grammars
 
 
@@ -734,6 +814,24 @@ if __name__ == "__main__":
 
     # 1.2.1 为静态语法归纳构建语法索引
     grammar_index = build_grammar_index(global_rules)
+
+    def _clamp(x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def _auto_rule_budget(grammar_index, flags):
+        lhs_to_rules = grammar_index["lhs_to_rules"]
+        total_rules = sum(len(v) for v in lhs_to_rules.values())
+
+        max_rules = int(total_rules * flags.graph_max_rules_ratio)
+        max_rules = _clamp(max_rules, flags.graph_max_rules_low, flags.graph_max_rules_high)
+
+        min_rules = int(max_rules * flags.graph_min_rules_ratio)
+        min_rules = _clamp(min_rules, flags.graph_min_rules_low, max_rules)
+
+        return max_rules, min_rules
+
+    auto_max_rules, auto_min_rules = _auto_rule_budget(grammar_index, FLAGS)
+
 
     # 如果需要做 symbol 级幻觉映射，构建 SymbolMapper（用同一个 CodeEmbedder）
     symbol_mapper = None
@@ -845,6 +943,16 @@ if __name__ == "__main__":
         # test_grammar_accuracy = evaluate_grammars(test_grammar_counters, test_examples, global_parser)
         test_grammar_accuracy = 0.0
         logger.info(f"test accuracy {test_accuracy}")
+        if hasattr(llm, "get_token_usage"):
+            usage = llm.get_token_usage()
+            logger.info(
+                "Token usage (fresh API calls only): "
+                f"prompt={usage.get('prompt_tokens', 0)}, "
+                f"completion={usage.get('completion_tokens', 0)}, "
+                f"total={usage.get('total_tokens', 0)},"
+                f"num_fresh_calls={usage.get('num_fresh_calls', 0)}"
+        )
+
 
     ## log to wandb
     wandb.log({

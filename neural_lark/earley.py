@@ -7,22 +7,45 @@ from transformers import AutoTokenizer, AutoModel
 from neural_lark.train_utils import logger
 from neural_lark.lark_utils import *
 
-sb_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/paraphrase-MiniLM-L6-v2')
-sb_model = AutoModel.from_pretrained('sentence-transformers/paraphrase-MiniLM-L6-v2')
-sb_model.eval()
+_SB_MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
+_sb_tokenizer = None
+_sb_model = None
+
+def _get_sentencebert():
+    global _sb_tokenizer, _sb_model
+    if _sb_tokenizer is not None and _sb_model is not None:
+        return _sb_tokenizer, _sb_model
+
+    try:
+        _sb_tokenizer = AutoTokenizer.from_pretrained(_SB_MODEL_NAME)
+        _sb_model = AutoModel.from_pretrained(_SB_MODEL_NAME)
+        _sb_model.eval()
+        return _sb_tokenizer, _sb_model
+    except Exception as e:
+        logger.warning(f"Failed to load SentenceBERT model {_SB_MODEL_NAME}: {e}")
+        return None, None
+
 
 def score_by_sentencebert(prediction, candidate):
-    def mean_pooling(model_output, attention_mask):
-        token_embeddings = model_output[0] #First element of model_output contains all token embeddings
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    sb_tokenizer, sb_model = _get_sentencebert()
+    if sb_tokenizer is None or sb_model is None:
+        # 无法加载 SB（比如 HF 连不上）时直接降级，避免程序崩溃
+        return 0.0
 
-    encoded_input = sb_tokenizer([prediction, candidate], padding=True, truncation=True, return_tensors='pt')
+    def mean_pooling(model_output, attention_mask):
+        token_embeddings = model_output[0]  # First element contains token embeddings
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+            input_mask_expanded.sum(1), min=1e-9
+        )
+
+    encoded_input = sb_tokenizer([prediction, candidate], padding=True, truncation=True, return_tensors="pt")
     with torch.no_grad():
         model_output = sb_model(**encoded_input)
-        sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+        sentence_embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
         score = torch.cosine_similarity(sentence_embeddings[0], sentence_embeddings[1], dim=0)
         return score.item()
+
 
 
 def predict_program_with_earley_correction(llm, prompt, parser):

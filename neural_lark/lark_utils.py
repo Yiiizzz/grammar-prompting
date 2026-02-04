@@ -349,17 +349,26 @@ def build_grammar_index(global_rules):
 
     # 简单版“社区”：对 nt_forward / nt_reverse 建无向图，做连通分量
     nt_graph = collections.defaultdict(set)
+    nonterminals = set(lhs_to_rules.keys())
+
+    # 确保孤立 NT 也在图里（否则后面遍历会漏）
+    for nt in nonterminals:
+        _ = nt_graph[nt]
+
     for a, children in nt_forward.items():
+        if a not in nonterminals:
+            continue
         for b in children:
-            # 只在非终结符之间建连边（都不带引号的符号）
-            if isinstance(b, str) and (b not in symbol_to_rules):
+            # b 是非终结符：1) 不带引号 2) 也是某条规则的 LHS
+            if isinstance(b, str) and (not b.startswith("\"")) and (b in nonterminals):
                 nt_graph[a].add(b)
                 nt_graph[b].add(a)
+
 
     nt_components = {}
     comp_id = 0
     visited = set()
-    for nt in nt_graph.keys():
+    for nt in nonterminals:
         if nt in visited:
             continue
         comp_nodes = []
@@ -666,7 +675,13 @@ def induce_grammar_by_spreading_activation(
     k_hop_up: int = 2,
     k_hop_down: int = 2,
     large_nt_threshold: int = 20,
+    large_nt_percentile: float = 80.0,
+    max_rules: int = 600,
+    min_rules: int = 200,
+    max_k_up: int = 6,
+    max_k_down: int = 6,
 ):
+
     """
     图扩散版静态语法归纳（简化版）：
       - 从 draft_program 提取 symbol
@@ -677,6 +692,67 @@ def induce_grammar_by_spreading_activation(
     """
     if grammar_index is None:
         return None
+    
+    def _percentile_int(values, pct: float) -> int:
+        values = sorted(int(v) for v in values)
+        if not values:
+            return 0
+        if pct <= 0:
+            return values[0]
+        if pct >= 100:
+            return values[-1]
+        idx = int(round((pct / 100.0) * (len(values) - 1)))
+        return values[idx]
+
+    def _auto_large_nt_threshold(lhs_to_rules_dict) -> int:
+        counts = [len(v) for v in lhs_to_rules_dict.values()]
+        thr = _percentile_int(counts, large_nt_percentile)
+        return max(1, int(thr))
+
+    def _auto_k_up(seed_nts, start_symbol, nt_reverse_dict, nonterminals_set) -> int:
+        if not seed_nts:
+            return 2
+
+        # start_symbol 可能是 str，也可能是 list/tuple/set
+        if isinstance(start_symbol, (list, tuple, set)):
+            start_set = set(start_symbol)
+        elif start_symbol:
+            start_set = {start_symbol}
+        else:
+            start_set = set()
+
+        if not start_set:
+            return 2
+
+        # 如果 seed 已经包含任一 start，距离就是 0
+        if seed_nts.intersection(start_set):
+            return 0
+
+        frontier = set(seed_nts)
+        visited = set(frontier)
+        dist = 0
+
+        while frontier and dist < max_k_up:
+            dist += 1
+            new_frontier = set()
+            for nt in frontier:
+                for parent in nt_reverse_dict.get(nt, []):
+                    if parent not in nonterminals_set:
+                        continue
+                    if parent in start_set:
+                        return dist
+                    if parent not in visited:
+                        visited.add(parent)
+                        new_frontier.add(parent)
+            frontier = new_frontier
+
+        return 2
+
+
+    def _select_rules_for_large_nt(rules, keep_n: int):
+        rules_sorted = sorted(rules, key=lambda r: str(r))
+        return rules_sorted[:keep_n]
+
 
     # 1. 从草稿中抽取 symbol 集合，并做幻觉修复
     symbols = collect_symbols_for_induction(
@@ -689,16 +765,36 @@ def induce_grammar_by_spreading_activation(
 
     symbol_to_rules = grammar_index["symbol_to_rules"]
     lhs_to_rules = grammar_index["lhs_to_rules"]
+    if large_nt_threshold is None or large_nt_threshold <= 0:
+        large_nt_threshold = _auto_large_nt_threshold(lhs_to_rules)
+
     child_to_parent = grammar_index["child_to_parent_rules"]
     nt_forward = grammar_index.get("nt_forward", {})
     nt_reverse = grammar_index.get("nt_reverse", {})
     nt_components = grammar_index.get("nt_components", {})
+
+    def _add_rules_for_nt(nt: str) -> bool:
+        all_rules = list(lhs_to_rules.get(nt, []))
+        if not all_rules:
+            return True
+
+        if len(all_rules) > large_nt_threshold:
+            all_rules = _select_rules_for_large_nt(all_rules, large_nt_threshold)
+
+        for r in all_rules:
+            if len(rule_set) >= max_rules:
+                return False
+            rule_set.add(r)
+        return True
+
 
     # 2. 初始 rule_set：所有包含这些 symbol 的规则
     rule_set = set()
     seed_nts = set()
     for s in symbols:
         for r in symbol_to_rules.get(s, []):
+            if len(rule_set) >= max_rules:
+                return rulelist2larkstr(rule_set)
             rule_set.add(r)
             seed_nts.add(r.origin)
 
@@ -706,6 +802,11 @@ def induce_grammar_by_spreading_activation(
         return None
 
     activated_nts = set(seed_nts)
+    nonterminals = set(lhs_to_rules.keys())
+    if k_hop_up is None or k_hop_up <= 0:
+        k_hop_up = _auto_k_up(seed_nts, start_lhs, nt_reverse, nonterminals)
+    k_hop_up = min(int(k_hop_up), int(max_k_up))
+
 
     # 2.1 模块激活：把和 seed_nts 在同一个连通块里的 NT 一起激活
     comp_to_nts = collections.defaultdict(set)
@@ -718,8 +819,9 @@ def induce_grammar_by_spreading_activation(
         for other in comp_to_nts[cid]:
             if other not in activated_nts:
                 activated_nts.add(other)
-                for r in lhs_to_rules.get(other, []):
-                    rule_set.add(r)
+                if not _add_rules_for_nt(other):
+                    return rulelist2larkstr(rule_set)
+
 
     # 3. 向上扩散（沿 child_to_parent / nt_reverse）
     frontier = set(activated_nts)
@@ -731,8 +833,9 @@ def induce_grammar_by_spreading_activation(
                 if parent_nt not in activated_nts:
                     activated_nts.add(parent_nt)
                     new_frontier.add(parent_nt)
-                    for r in lhs_to_rules.get(parent_nt, []):
-                        rule_set.add(r)
+                    if not _add_rules_for_nt(parent_nt):
+                        return rulelist2larkstr(rule_set)
+
         frontier = new_frontier
         if not frontier:
             break
@@ -748,35 +851,56 @@ def induce_grammar_by_spreading_activation(
         for s in start_symbols:
             if s not in activated_nts:
                 activated_nts.add(s)
-                for r in lhs_to_rules.get(s, []):
-                    rule_set.add(r)
+                if not _add_rules_for_nt(s):
+                    return rulelist2larkstr(rule_set)
 
 
-    # 4. 受限向下扩散（避免大枚举 NT 全展开）
+
+    # 4. 受限向下扩散（预算/阈值控制）
     frontier = set(activated_nts)
-    for _ in range(k_hop_down):
+    down_steps = k_hop_down if (k_hop_down is not None and k_hop_down > 0) else max_k_down
+
+    for _ in range(down_steps):
+        if len(rule_set) >= max_rules:
+            break
+
+        # 只有在“自动 k_down 模式”（k_hop_down<=0）才用 min_rules 当停止目标
+        if (k_hop_down is None or k_hop_down <= 0) and len(rule_set) >= min_rules:
+            break
+
         new_frontier = set()
         for nt in frontier:
             all_rules_for_lhs = list(lhs_to_rules.get(nt, []))
             if not all_rules_for_lhs:
                 continue
-            # 大枚举节点：分支太多，避免一次性拉进来
+
+            # 大分支：选一部分，不再直接跳过
             if len(all_rules_for_lhs) > large_nt_threshold:
-                continue
-            # 小枚举节点：拉进来所有规则，并向下扩散
-            for r in all_rules_for_lhs:
-                if r not in rule_set:
-                    rule_set.add(r)
-            for r in all_rules_for_lhs:
+                selected_rules = _select_rules_for_large_nt(all_rules_for_lhs, large_nt_threshold)
+            else:
+                selected_rules = all_rules_for_lhs
+
+            # 加规则（受 max_rules 约束）
+            for r in selected_rules:
+                if len(rule_set) >= max_rules:
+                    break
+                rule_set.add(r)
+
+            if len(rule_set) >= max_rules:
+                break
+
+            # 向下激活子 NT
+            for r in selected_rules:
                 for sym in r.expansion:
-                    # 向下只对非终结符扩散（不带引号、且不是纯终结符 token）
                     if isinstance(sym, str) and not sym.startswith("\""):
                         if sym not in activated_nts:
                             activated_nts.add(sym)
                             new_frontier.add(sym)
+
         frontier = new_frontier
         if not frontier:
             break
+
 
     # 5. 打包成 lark 语法
     lark_str = rulelist2larkstr(rule_set)

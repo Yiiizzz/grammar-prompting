@@ -24,8 +24,10 @@ call: event
     | "(Yield (size" org "))"
     | "(Yield"  event ")"
     | "(Yield"  weather ")" 
+    | "(Yield"  datetime ")"
     | "(Yield (> (size"  event ")" number "))"
     | "(do" datetime call ")"
+    | "(do" string call ")"
     | "(do" call  call ")"
     | "(do" org  call ")"
 

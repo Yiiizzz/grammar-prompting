@@ -21,27 +21,27 @@ logger = setup_logger()
 
 def setup_logger_file(logger, log_dir, run_name=None):
     """
-    Send info to console, and detailed debug information in logfile
-    (Seems not working)
+    Send info to console, and detailed debug information in logfile.
     """
     timestr = time.strftime("%Y%m%d-%H%M%S")
-    base = run_name or "log"
-    logfile_path = os.path.join(log_dir, f"{base}_{timestr}.txt")
-    os.makedirs(os.path.dirname(logfile_path), exist_ok=True)
+
+    # 关键：文件名保持短，避免 Windows 路径过长
+    logfile_path = os.path.join(log_dir, f"run_{timestr}.txt")
+    os.makedirs(log_dir, exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(module)s - %(message)s")
+
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
-    # sh.setLevel(logging.INFO)
 
-    fh = logging.FileHandler(logfile_path)
+    fh = logging.FileHandler(logfile_path, encoding="utf-8")
     fh.setFormatter(formatter)
-    # fh.setLevel(logging.DEBUG)
 
     logger.addHandler(fh)
-    logger.addHandler(sh)  # log to console as well
+    logger.addHandler(sh)
 
     logger.info("Logging to {}".format(logfile_path))
+
 
 
 

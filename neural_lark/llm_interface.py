@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any, Dict, List
 import json
 import hashlib
+import requests
+
 
 import openai
-import google.generativeai as palm
-import google.api_core.exceptions as palm_exceptions
+
 
 from http import HTTPStatus
 import dashscope
@@ -91,6 +92,7 @@ class LargeLanguageModel(abc.ABC):
             completions = self._sample_completions(prompt,
                                                    temperature,
                                                    stop_token, num_completions)
+            self._accumulate_usage(completions)
             # Cache the completions.
             with open(cache_filepath, 'wb') as f:
                 pickle.dump(completions, f)
@@ -108,10 +110,33 @@ class LargeLanguageModel(abc.ABC):
             completions = self._sample_completions(prompt,
                                                    temperature,
                                                    stop_token, num_completions)
+            self._accumulate_usage(completions)
             with open(cache_filepath, 'wb') as f:
                 pickle.dump(completions, f)
             logger.debug(f"Overwrote corrupted cache at {cache_filepath}.")
             return completions
+        
+    def _ensure_usage(self):
+        if not hasattr(self, "_token_usage"):
+            self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            self._token_usage_num_calls = 0
+
+    def _accumulate_usage(self, completions):
+        self._ensure_usage()
+        if not completions:
+            return
+        usage = getattr(completions[0], "other_info", {}).get("usage")
+        if not isinstance(usage, dict):
+            return
+        self._token_usage["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+        self._token_usage["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+        self._token_usage["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+        self._token_usage_num_calls += 1
+
+    def get_token_usage(self):
+        self._ensure_usage()
+        return dict(self._token_usage, num_fresh_calls=self._token_usage_num_calls)
+
     
     def greedy_completion(self,
                           prompt: str,
@@ -173,10 +198,12 @@ class GPT(LargeLanguageModel):
             raise RuntimeError("Failed to query OpenAI API.")
         
         assert len(response["choices"]) == num_completions
+        usage = response.get("usage", {})
         return [
-            self._raw_to_llm_response(r, prompt, temperature,stop_token, num_completions)
+            self._raw_to_llm_response(r, prompt, temperature, stop_token, num_completions, usage=usage)
             for r in response["choices"]
         ]
+
     
     def _sample_next_token_with_logit_bias(self, prompt, logit_bias, temperature=0.0):
         response = None
@@ -201,7 +228,8 @@ class GPT(LargeLanguageModel):
                              prompt: str,
                              temperature: float, 
                              stop_token: str,
-                             num_completions: int) -> LLMResponse:
+                             num_completions: int,
+                             usage=None) -> LLMResponse:
         text = raw_response["text"]
 
         text = text.strip()
@@ -213,10 +241,13 @@ class GPT(LargeLanguageModel):
             "num_completions": num_completions,
             "stop_token": stop_token,
         }
+        other = raw_response.copy()
+        if isinstance(usage, dict):
+            other["usage"] = usage
         return LLMResponse(prompt,
                            text,
                            prompt_info=prompt_info,
-                           other_info=raw_response.copy())
+                           other_info=other)
 
     def evaluate_completion(self, prefix: str, suffix:str, average=True) -> float:
         while True:
@@ -273,7 +304,12 @@ class PaLM(LargeLanguageModel):
 
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
-        palm.configure(api_key=self.PALM_API_KEY)
+        import google.generativeai as palm
+        import google.api_core.exceptions as palm_exceptions
+        self._palm = palm
+        self._palm_exceptions = palm_exceptions
+        self._palm.configure(api_key=self.PALM_API_KEY)
+
     
     def get_id(self) -> str:
         return f"palm_{self._model_name}"
@@ -287,13 +323,13 @@ class PaLM(LargeLanguageModel):
         response = None
         for _ in range(12):
             try:
-                response = palm.generate_text(prompt=prompt,
+                response = self._palm.generate_text(prompt=prompt,
                                             model=self._model_name,
                                             max_output_tokens=FLAGS.max_tokens,
                                             temperature=temperature,
                                             stop_sequences=[stop_token],
                                             candidate_count=num_completions)
-            except palm_exceptions.ResourceExhausted as e:
+            except self._palm_exceptions.ResourceExhausted as e:
                 logger.debug("ResourceExhausted, waiting..")
                 # logger.warn(f"Error {str(e)}")
                 time.sleep(120)
@@ -379,27 +415,33 @@ class ChatGPT(LargeLanguageModel):
             raise RuntimeError("Failed to query OpenAI API.")
         
         assert len(response["choices"]) == num_completions
+        usage = response.get("usage", {})
         return [
-            self._raw_to_llm_response(r, prompt, temperature,stop_token, num_completions)
+            self._raw_to_llm_response(r, prompt, temperature, stop_token, num_completions, usage=usage)
             for r in response["choices"]
         ]
+
 
     @staticmethod
     def _raw_to_llm_response(raw_response: Dict[str, Any], 
                              prompt: str,
                              temperature: float, 
                              stop_token: str,
-                             num_completions: int) -> LLMResponse:
+                             num_completions: int,
+                             usage=None) -> LLMResponse:
         text = raw_response["message"]["content"]
         prompt_info = {
             "temperature": temperature,
             "num_completions": num_completions,
             "stop_token": stop_token,
         }
+        other = raw_response.copy()
+        if isinstance(usage, dict):
+            other["usage"] = usage
         return LLMResponse(prompt,
                            text,
                            prompt_info=prompt_info,
-                           other_info=raw_response.copy())
+                           other_info=other)
 
 
 class Qwen(LargeLanguageModel):
@@ -475,12 +517,29 @@ class Qwen(LargeLanguageModel):
             "num_completions": num_completions,
             "stop_token": stop_token,
         }
+        usage = None
+        for k in ("usage", "token_usage"):
+            try:
+                usage = response[k]
+                break
+            except Exception:
+                pass
+
+
+        other_info = {"raw_output": text}
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+            ct = usage.get("completion_tokens", usage.get("output_tokens", 0))
+            tt = usage.get("total_tokens", (pt or 0) + (ct or 0))
+            other_info["usage"] = {"prompt_tokens": pt or 0, "completion_tokens": ct or 0, "total_tokens": tt or 0}
+
         llm_resp = LLMResponse(
             prompt,
             text,
             prompt_info=prompt_info,
-            other_info={"raw_output": text},
+            other_info=other_info,
         )
+
         return [llm_resp]
 
 
@@ -560,6 +619,198 @@ class ZhipuChat(LargeLanguageModel):
         )
         return [llm_resp]
 
+class OpenAIResponses(LargeLanguageModel):
+    """
+    OpenAI Responses API backend via raw HTTP (works even with openai==0.28).
+    Use: --engine openai/<model_name>
+    Env: OPENAI_API_KEY
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+        self._api_key = os.environ.get("OPENAI_API_KEY")
+        if not self._api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    def get_id(self) -> str:
+        return f"openairesp_{self._model_name}"
+
+    def _sample_completions(
+        self,
+        prompt: str,
+        temperature: float,
+        stop_token: str,
+        num_completions: int = 1,
+    ) -> List[LLMResponse]:
+        if num_completions != 1:
+            logger.warning(
+                f"OpenAI Responses backend only supports num_completions=1; got {num_completions}, using 1."
+            )
+            num_completions = 1
+
+        url = "https://api.openai.com/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self._model_name,
+            "input": prompt,
+            "temperature": temperature,
+            "max_output_tokens": FLAGS.max_tokens,
+        }
+
+        resp_json = None
+        for _ in range(6):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=120)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"{r.status_code}: {r.text}")
+                resp_json = r.json()
+                break
+            except Exception as e:
+                logger.warning(f"OpenAI Responses API error {e}, retrying...")
+                time.sleep(6)
+
+        if resp_json is None:
+            raise RuntimeError("Failed to query OpenAI Responses API.")
+
+        text = resp_json.get("output_text")
+        if not isinstance(text, str):
+            parts = []
+            for item in (resp_json.get("output") or []):
+                for c in (item.get("content") or []):
+                    if c.get("type") in {"output_text", "text"} and isinstance(c.get("text"), str):
+                        parts.append(c["text"])
+            text = "\n".join(parts)
+
+        text = (text or "").strip()
+
+        # 手动 stop（你的代码里 stop_token 常用 "\n\n" 或 DELIMITER）
+        if stop_token:
+            idx = text.find(stop_token)
+            if idx != -1:
+                text = text[:idx]
+
+        usage = resp_json.get("usage")
+        if isinstance(usage, dict):
+            # Responses API 常见字段是 input/output
+            pt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+            ct = usage.get("completion_tokens", usage.get("output_tokens", 0))
+            tt = usage.get("total_tokens", (pt or 0) + (ct or 0))
+            resp_json["usage"] = {"prompt_tokens": pt or 0, "completion_tokens": ct or 0, "total_tokens": tt or 0}
+
+
+        return [
+            LLMResponse(
+                prompt,
+                text,
+                prompt_info={
+                    "temperature": temperature,
+                    "num_completions": num_completions,
+                    "stop_token": stop_token,
+                },
+                other_info=resp_json,
+            )
+        ]
+
+class Gemini(LargeLanguageModel):
+    """
+    Gemini backend via google.generativeai (GenerativeModel).
+    Use: --engine gemini/<model_name>
+    Env: GOOGLE_API_KEY (or GEMINI_API_KEY)
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.")
+        
+
+    def get_id(self) -> str:
+        mid = hashlib.md5(self._model_name.encode("utf-8")).hexdigest()[:10]
+        return f"gemini_{mid}"
+
+
+    def _sample_completions(
+        self,
+        prompt: str,
+        temperature: float,
+        stop_token: str,
+        num_completions: int = 1,
+    ) -> List[LLMResponse]:
+        if num_completions != 1:
+            logger.warning(
+                f"Gemini backend only supports num_completions=1; got {num_completions}, using 1."
+            )
+            num_completions = 1
+
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._model_name}:generateContent?key={api_key}"
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": FLAGS.max_tokens,
+            },
+        }
+
+        # 可选：只有 temperature 非 0 才传，避免某些模型/配置不支持
+        if temperature and float(temperature) != 0.0:
+            payload["generationConfig"]["temperature"] = float(temperature)
+
+        # stop 序列
+        if stop_token:
+            payload["generationConfig"]["stopSequences"] = [stop_token]
+
+        resp_json = None
+        for _ in range(6):
+            try:
+                r = requests.post(url, json=payload, timeout=60)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"{r.status_code}: {r.text}")
+                resp_json = r.json()
+                break
+            except Exception as e:
+                logger.warning(f"Gemini REST API error {e}, retrying...")
+                time.sleep(6)
+
+        if resp_json is None:
+            raise RuntimeError("Failed to query Gemini REST API.")
+
+        # 取第一条 candidate 的 text
+        text = ""
+        try:
+            parts = resp_json["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        except Exception:
+            text = ""
+
+        text = (text or "").strip()
+
+        # 防御式 stop 截断
+        if stop_token:
+            idx = text.find(stop_token)
+            if idx != -1:
+                text = text[:idx]
+
+        return [
+            LLMResponse(
+                prompt,
+                text,
+                prompt_info={
+                    "temperature": temperature,
+                    "num_completions": num_completions,
+                    "stop_token": stop_token,
+                },
+                other_info=resp_json,
+            )
+        ]
+
 
 
 def setup_llm(engine):
@@ -568,12 +819,12 @@ def setup_llm(engine):
     if platform == "azure":
         llm = GPT(engine_short)
     elif platform == "google":
-        llm = PaLM(engine_short)
+        llm = PaLM(engine_short)  # 老 PaLM 后端（可留可删）
+    elif platform == "gemini":
+        llm = Gemini(engine_short)
     elif platform == "openai":
-        if engine_short == "code-davinci-002":
-            llm = GPT(engine_short, use_azure=False)
-        else:
-            llm = ChatGPT(engine_short)
+        # 建议：openai 全部走 Responses API，后续换任何 GPT 模型都不改代码
+        llm = OpenAIResponses(engine_short)
     elif platform == "qwen":
         llm = Qwen(engine_short)
     elif platform == "zhipu":
@@ -581,3 +832,4 @@ def setup_llm(engine):
     else:
         raise NotImplementedError(f"platform {platform} not supported")
     return llm
+

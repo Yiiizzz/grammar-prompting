@@ -56,6 +56,33 @@ def parse_args():
     parser.add_argument("--use_retrieved_rule_flag", action="store_true")
     parser.add_argument("--retrieved_rule_topk", type=int, default=8)
 
+    # graph spreading induction hyperparams (auto)
+    parser.add_argument("--graph_k_up", type=int, default=-1,
+                        help="<=0 means auto by distance-to-start; otherwise fixed k_up.")
+    parser.add_argument("--graph_max_k_up", type=int, default=6)
+
+    parser.add_argument("--graph_k_down", type=int, default=-1,
+                        help="<=0 means auto by rule budget; otherwise fixed k_down.")
+    parser.add_argument("--graph_max_k_down", type=int, default=6)
+
+    parser.add_argument("--graph_large_nt_threshold", type=int, default=-1,
+                        help="<=0 means auto by percentile of branching factor.")
+    parser.add_argument("--graph_large_nt_percentile", type=float, default=80.0)
+
+    parser.add_argument("--graph_max_rules", type=int, default=-1,
+                        help="<=0 means auto by global grammar size.")
+    parser.add_argument("--graph_min_rules", type=int, default=-1,
+                        help="<=0 means auto (derived from max_rules).")
+    parser.add_argument("--graph_max_rules_ratio", type=float, default=0.10)
+    parser.add_argument("--graph_min_rules_ratio", type=float, default=0.35)
+
+    parser.add_argument("--graph_max_rules_low", type=int, default=200)
+    parser.add_argument("--graph_max_rules_high", type=int, default=2000)
+    parser.add_argument("--graph_min_rules_low", type=int, default=50)
+
+
+
+
 
     ## for iterative prompting
     parser.add_argument("--num_iterations", type=int, default=1)
